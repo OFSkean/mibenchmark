@@ -1,8 +1,9 @@
 import os, argparse, logging
+from tqdm import tqdm
 from libs.bounds import estimate_mutual_information
 from libs.critics import set_critic, log_prob_gaussian
-from libs.utils_gaussian import gaussian_batch
-from libs.utils_images import *
+from libs.utils_gaussian import GaussianDataset
+from libs.utils_images import ImageDataset, image_subset
 from libs.utils_text import *
 from libs.utils_mixture import *
 from libs.models import mlp
@@ -15,6 +16,7 @@ parser = argparse.ArgumentParser()
 # Define command-line arguments
 parser.add_argument("--gpu_id", type=int, default=0)  # For CPU implementation, set -1
 parser.add_argument("--savepath", type=str, default="results/gaussian")
+parser.add_argument("--num-workers", type=int, default=64)
 
 parser.add_argument("--ds", type=int, default=10, help="number of information sources")
 parser.add_argument("--dr", type=int, default=10, help="representation dimension")
@@ -82,17 +84,8 @@ def main():
     assert np.max(true_mi) <= args.ds, "ds should be larger than the true MI"
     bsc_p = []
     for mi in true_mi:
-        if args.mode == "stepwise":
-            bsc_p += [cal_bsc(np.prod(image_patches), mi)] * (args.n_steps // 5)
-        else:
-            bsc_p += [cal_bsc(np.prod(image_patches), mi)] * args.n_steps
+        bsc_p.extend([cal_bsc(np.prod(image_patches), mi)])
     
-    # Load datasets based on dtype
-    if args.dtype in ["image", "mixture"]:
-        images, idx_dict = image_subset(args.dname1, subclass_list=[0, 1], grayscale=False)
-        img_size = int(np.sqrt(args.dr // args.image_channels))
-    if args.dtype in ["text", "mixture"]:
-        texts = TextDataset(dataname=args.dname2)
         
     # Initialize encoder if specified
     if args.encoder != "None":
@@ -107,6 +100,38 @@ def main():
             else:
                 encoder_fn = encoder_fn(args.dr).to(device)
     
+    # Initialize datasets
+    if args.dtype == "gaussian":
+        dataset = GaussianDataset(true_mi, 
+                                 args.ds, 
+                                 args.batch_size, 
+                                 cubic=args.gaussian_cubic)
+    elif args.dtype in ["image", "text", "mixture"]:
+        if args.dtype in ["image", "mixture"]:
+            images, idx_dict = image_subset(args.dname1, subclass_list=[0, 1], grayscale=False)
+            img_size = int(np.sqrt(args.dr // args.image_channels))
+            image_dataset = ImageDataset(img_size, 
+                                images, 
+                                idx_dict, 
+                                image_patches, 
+                                bsc_p, 
+                                args.batch_size, 
+                                nuisance=args.nuisance)
+        if args.dtype in ["text", "mixture"]:
+            text_dataset = TextDataset(ds=args.ds, 
+                                bsc_p=bsc_p, 
+                                batch_size=args.batch_size, 
+                                dataname=args.dname2, 
+                                root="dataset")
+            
+        if args.dtype == "mixture":
+            dataset = MixtureDataset(image_dataset, text_dataset)
+        else:
+            dataset = image_dataset if args.dtype == "image" else text_dataset
+
+    
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
     # Define the function to train the estimator
     def train_estimator(critic_params, mi_params, opt_params, **kwargs):
         # Set critic based on encoder type
@@ -151,51 +176,34 @@ def main():
         
         estimates = []
         buffer = None
-        for i in range(opt_params['iterations']):
-            torch.manual_seed(i)
-            # Generate batches based on dtype
-            if args.dtype == "gaussian":
-                z1, z2 = gaussian_batch(true_mi[i], args.ds, args.batch_size, cubic=args.gaussian_cubic, seed=i)
-            elif args.dtype == "image":
-                z1, z2 = image_batch(img_size, images, idx_dict, image_patches, bsc_p=bsc_p[i], batch_size=args.batch_size)
-                if (z1.size(1) == 1) & (args.image_channels == 3):
-                    z1 = torch.tile(z1, (1, 3, 1, 1))
-                    z2 = torch.tile(z2, (1, 3, 1, 1))
-            elif args.dtype == "text":
-                z1, z2 = text_batch(texts, args.ds, bsc_p=bsc_p[i], batch_size=args.batch_size, n_sample=None)
-                if args.encoder in ["irevnet", "pretrained_resnet"]:
-                    z1 = z1.unsqueeze(1); z1 = z1.unsqueeze(-1)
-                    z2 = z2.unsqueeze(1); z2 = z2.unsqueeze(-1)
-                    z1 = torch.tile(z1, (1, 3, 1, 1))
-                    z2 = torch.tile(z2, (1, 3, 1, 1))
-            elif args.dtype == "mixture":
-                z1, z2 = mixture_batch(images, idx_dict, texts, img_size, image_patches, args.ds, bsc_p=bsc_p[i], batch_size=args.batch_size, return_label=False)
-            if args.nuisance > 0:
-                z1 = torch.tile(z1, (1, 3, 1, 1))
-                z2 = torch.tile(z2, (1, 3, 1, 1))
-                z1, z2 = apply_background(img_size, args.batch_size, z1, z2, args.nuisance, output_channels=args.image_channels)            
-            
-            with torch.no_grad():
-                if args.encoder == "irevnet":
-                    _, z1 = encoder_fn(z1.to(device))
-                    _, z2 = encoder_fn(z2.to(device))
-                elif args.encoder in ["realnvp", "maf"]:
-                    z1, _ = encoder_fn(z1.view(args.batch_size, -1).to(device))
-                    z2, _ = encoder_fn(z2.view(args.batch_size, -1).to(device))
-                elif args.encoder == "pretrained_resnet":
-                    z1 = encoder_fn(z1.to(device))
-                    z2 = encoder_fn(z2.to(device))
-            
-            mi, buffer = train_step(z1.view(args.batch_size, -1).cuda(), z2.view(args.batch_size, -1).cuda(), mi_params, buffer=buffer)
-            mi = mi.detach().cpu().numpy()
-            if args.output_scale == "bit":
-                mi = nat2bit(mi)
-                truth = nat2bit(true_mi[i])
-            if i % 1000 == 0:
-                log.info(f'STEP: {i}, Truth: {truth:.3f}, Estimated: {mi:.3f}, Average: {np.mean(estimates):.3f}')
-            estimates.append(mi)
 
-        return np.array(estimates)
+        with tqdm(enumerate(dataloader), total=len(dataloader), desc="Training") as pbar:
+            for i, batch in pbar:
+                z1, z2 = batch
+                
+                with torch.no_grad():
+                    if args.encoder == "irevnet":
+                        _, z1 = encoder_fn(z1.to(device))
+                        _, z2 = encoder_fn(z2.to(device))
+                    elif args.encoder in ["realnvp", "maf"]:
+                        z1, _ = encoder_fn(z1.view(args.batch_size, -1).to(device))
+                        z2, _ = encoder_fn(z2.view(args.batch_size, -1).to(device))
+                    elif args.encoder == "pretrained_resnet":
+                        z1 = encoder_fn(z1.to(device))
+                        z2 = encoder_fn(z2.to(device))
+                
+                mi, buffer = train_step(z1.view(args.batch_size, -1).cuda(), z2.view(args.batch_size, -1).cuda(), mi_params, buffer=buffer)
+                
+                mi = mi.detach().cpu().numpy()
+                if args.output_scale == "bit":
+                    mi = nat2bit(mi)
+                    truth = nat2bit(true_mi[i])
+                if (i+1) % 100 == 0:
+                    pbar.set_description(f'Truth: {truth:.3f}, Average: {np.mean(estimates[i-100:i]):.3f}')
+                
+                estimates.append(mi)
+
+            return np.array(estimates)
 
     # Set parameters for mutual information estimation
     mi_params = dict(estimator=args.estimator, critic=args.critic_type, baseline='unnormalized')
@@ -222,4 +230,5 @@ def main():
     return mis
 
 if __name__ == "__main__":
+    print('======================================== START ESTIMATION =======================================')
     main()

@@ -17,17 +17,19 @@ def bit2nat(bit, steps=0):
             t += [b2n(tmi)] * _
         return t
     else:
-        return [bit] * steps
+        return [b2n(bit)] * steps
         
 def cal_bsc(patches, target_mi): #target_mi in bit scale
     if np.prod(patches) == target_mi:
         print("NO BSC")
         return 0
     else:
-        x = np.arange(0, 0.501, 0.001)
+        x = np.arange(0, 0.501, 0.0001)
         mi = patches * (1 + (x * np.log2(x) + (1-x) * np.log2(1-x)))
-        truth = np.ones(len(x)) * target_mi
-        mi = np.nan_to_num(mi)
+        mi[0] = patches # fix nan error
+        assert np.all(np.isfinite(mi))
+
+        truth = np.full(len(x), target_mi)
+
         result = x[np.argmin(np.abs(truth - mi))]
-#         print("BSC ERROR: %.3f" %(np.min(np.abs(truth - mi))))
         return result

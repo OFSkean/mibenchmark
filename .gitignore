@@ -1,0 +1,8 @@
+*.npy
+*.log
+cifar10/
+*/__pycache__/
+mnist/
+.DS_Store
+._.DS_Store
+*.pyc

@@ -53,97 +53,120 @@ def image_subset(dataname, subclass_list, grayscale=False):
             idx_per_image.update({c: np.where(idx)[0]})
 
         return cifar, idx_per_image
-    
-    
-to_image = torchvision.transforms.ToPILImage()
-def get_image(img_size, images, idx_dict, n_patch, bsc_p=0, return_label=False):
-    idx = torch.ones(size=n_patch) * 0.5
-    idx = torch.bernoulli(idx)
-    bsc_idx = torch.ones(size=n_patch) * bsc_p
-    bsc_idx = torch.bernoulli(bsc_idx)
-    idx_2 = torch.abs(idx - bsc_idx)
 
-    im1, im2 = [], []
-    for p1 in range(n_patch[0]):
-        im1_1, im2_1 = [], []
-        for p2 in range(n_patch[1]):
-            im1_2, im2_2 = [], []
-            for p3 in range(n_patch[2]):
-                i = int(idx[p1, p2, p3])
-                j = int(idx_2[p1, p2, p3])
+class ImageDataset(torch.utils.data.Dataset):
+    def __init__(self, img_size, image_dataset, idx_dict, image_patches, bsc_p, batch_size, return_label=False, nuisance=0):
+        super().__init__()
+        
+        self.image_dataset = image_dataset
+        self.image_size = img_size
+        self.idx_dict = idx_dict
+        self.image_patches = image_patches
+        self.bsc_p = bsc_p
+        self.batch_size = batch_size
+        self.return_label = return_label
+        self.original_image_size = self.image_dataset[0][0].shape
+        self.nuisance = nuisance
+        self.background, _ = image_subset("cifar10", np.arange(10), grayscale=False)
+        self.to_image = torchvision.transforms.ToPILImage()
 
-                i = list(idx_dict.keys())[i]
-                j = list(idx_dict.keys())[j]
-                img1 = np.random.choice(idx_dict[i])
-                img2 = np.random.choice(idx_dict[j])
-                while img2 == img1:
-                    img2 = np.random.choice(idx_dict[j])
+        self.resize = torchvision.transforms.Compose([
+            torchvision.transforms.Resize(
+                size=(self.image_size, self.image_size),
+                interpolation=torchvision.transforms.InterpolationMode.BICUBIC
+            ),
+            torchvision.transforms.ToTensor()
+        ])
+        
+        self.bg_transform = torchvision.transforms.Compose([
+            torchvision.transforms.ToPILImage(),
+            torchvision.transforms.Resize(
+                size=(self.image_size, self.image_size),
+                interpolation=torchvision.transforms.InterpolationMode.BICUBIC
+            ),
+            torchvision.transforms.ToTensor()
+        ])
 
-                im1_2.append(images[img1][0])
-                im2_2.append(images[img2][0])
-            im1_1.append(torch.cat(im1_2, dim=-1))
-            im2_1.append(torch.cat(im2_2, dim=-1))
-        im1.append(torch.cat(im1_1, dim=1))
-        im2.append(torch.cat(im2_1, dim=1))
+    def __len__(self):
+        return len(self.bsc_p) * self.batch_size
 
-    im1 = to_image(torch.cat(im1))
-    im2 = to_image(torch.cat(im2))
-    resize = torchvision.transforms.Compose([
-        torchvision.transforms.Resize(
-            size=(img_size, img_size),
-            interpolation=torchvision.transforms.InterpolationMode.BICUBIC),
-        torchvision.transforms.ToTensor()])
-    if return_label:
-        return resize(im1), resize(im2), idx, idx_2
-    else:
-        return resize(im1), resize(im2)
-    
-def image_batch(img_size, images, idx_dict, n_patch, bsc_p=0, batch_size=64, return_label=False):
-    image1, image2 = [], []
-    if return_label:
-        label1, label2 = [], []
-    for b in range(batch_size):
-        if return_label:
-            x1, x2, y1, y2 = get_image(img_size, images, idx_dict, n_patch, bsc_p=bsc_p, return_label=True)
+    def __getitem__(self, idx):
+        torch.manual_seed(idx)
 
-            y1 = y1.numpy().reshape([-1]).tolist()
-            y1 = [int(y) for y in y1]
+        batch_idx = idx // self.batch_size
+        x1, x2, y1, y2 = self._generate_image(bsc_p=self.bsc_p[batch_idx])
 
-            y2 = y2.numpy().reshape([-1]).tolist()
-            y2 = [int(y) for y in y2]
+        if (x1.size(0) == 1) and (self.image_patches[0] == 3):
+            x1 = torch.tile(x1, (3, 1, 1))
+            x2 = torch.tile(x2, (3, 1, 1))
 
-            label1.append(int("".join(map(str, y1)), 2))
-            label2.append(int("".join(map(str, y2)), 2))
+        y1 = y1.numpy().reshape([-1]).tolist()
+        y1 = [int(y) for y in y1]
+        y2 = y2.numpy().reshape([-1]).tolist() 
+        y2 = [int(y) for y in y2]
+
+        label1 = int("".join(map(str, y1)), 2)
+        label2 = int("".join(map(str, y2)), 2)
+
+        if self.return_label:
+            return x1, x2, label1, label2
         else:
-            x1, x2 = get_image(img_size, images, idx_dict, n_patch, bsc_p=bsc_p)
-        image1.append(x1[None, :, :, :])
-        image2.append(x2[None, :, :, :])
-    if return_label:
-        return torch.cat(image1), torch.cat(image2), label1, label2
-    else:
-        return torch.cat(image1), torch.cat(image2)
+            return x1, x2
 
+    def _generate_image(self, bsc_p):
+        idx = torch.bernoulli(torch.full(size=self.image_patches, fill_value=0.5))
+        bsc_idx = torch.bernoulli(torch.full(size=self.image_patches, fill_value=bsc_p))
+        idx_2 = torch.abs(idx - bsc_idx)
 
+        # Pre-allocate tensors based on original image size and patches
+        _, h, w = self.original_image_size
+        channels, rows, cols = self.image_patches
+        full_h = h * rows
+        full_w = w * cols
+        
+        # Create empty tensors for the full images
+        img1 = torch.empty((channels, full_h, full_w))
+        img2 = torch.empty((channels, full_h, full_w))
 
-background, _ = image_subset("cifar10", np.arange(10), grayscale=False)
-def apply_background(img_size, batch_size, x1, x2, eta, output_channels=1):
-    bg_transform = torchvision.transforms.Compose([
-        torchvision.transforms.ToPILImage(),
-        torchvision.transforms.Resize(
-            size=(img_size, img_size),
-            interpolation=torchvision.transforms.InterpolationMode.BICUBIC),
-        torchvision.transforms.ToTensor()])
+        for p1 in range(channels):
+            for p2 in range(rows):
+                for p3 in range(cols):
+                    class_1 = list(self.idx_dict.keys())[int(idx[p1, p2, p3])]
+                    class_2 = list(self.idx_dict.keys())[int(idx_2[p1, p2, p3])]
 
-    bg_idx = np.random.choice(len(background), 2 * batch_size)
-    bg_batch = []
-    for i in bg_idx:
-        bg_batch.append(bg_transform(background.data[i])[None, :, :, :])
-    bg_batch = torch.cat(bg_batch)
+                    img_idx_1 = np.random.choice(self.idx_dict[class_1])
+                    img_idx_2 = np.random.choice(self.idx_dict[class_2])
+                    while img_idx_2 == img_idx_1:
+                        img_idx_2 = np.random.choice(self.idx_dict[class_2])
 
-    z1 = torch.clip(x1 + bg_batch[:batch_size] * eta, 0, 1)
-    z2 = torch.clip(x2 + bg_batch[batch_size:] * eta, 0, 1)
+                    img1[p1, p2*h:(p2+1)*h, p3*w:(p3+1)*w] = self.image_dataset[img_idx_1][0]
+                    img2[p1, p2*h:(p2+1)*h, p3*w:(p3+1)*w] = self.image_dataset[img_idx_2][0]
+
+        im1 = self.resize(self.to_image(img1))
+        im2 = self.resize(self.to_image(img2))
+
+        if self.nuisance > 0:
+            im1 = torch.tile(im1, (1, 3, 1, 1))
+            im2 = torch.tile(im2, (1, 3, 1, 1))
+            im1, im2 = self.apply_background(im1, im2)
+
+        return im1, im2, idx, idx_2
     
-    if output_channels == 1:
-        return (z1.mean(1, keepdims=True), z2.mean(1, keepdims=True)) #(z1, z2)
-    else:
-        return (z1, z2)
+    def apply_background(self, x1, x2):
+        bg_idx = np.random.choice(len(self.background), 2)
+        background_images = [
+            self.bg_transform(self.background.data[bg_idx[0]])[None, :, :, :],
+            self.bg_transform(self.background.data[bg_idx[1]])[None, :, :, :]
+        ]
+
+        z1 = torch.clip(x1 + background_images[0] * self.nuisance, 0, 1)
+        z2 = torch.clip(x2 + background_images[1] * self.nuisance, 0, 1)
+        
+        if self.image_patches[0] == 1:
+            return (z1.mean(1, keepdims=True), z2.mean(1, keepdims=True)) #(z1, z2)
+        else:
+            return (z1, z2)
+
+    @property
+    def dimensionality(self):
+        return self.image_size * self.image_size * self.image_patches[0]

@@ -1,6 +1,6 @@
 import torch.nn as nn
 from libs.models import mlp
-import torch, torchvision
+import torch
 
 class BilinearCritic(nn.Module):
     def __init__(self, dim, normalization=None, **extra_kwargs):
